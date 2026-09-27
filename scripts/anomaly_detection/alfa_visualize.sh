@@ -5,31 +5,22 @@ export CUDA_VISIBLE_DEVICES=0
 
 python -u run.py \
     --task_name anomaly_detection \
-    --stage pretrain \
-    --model_id LSTM_AE_ALFA \
+    --stage test \
     --model LSTM_AE \
     --data ALFA \
     --root_path ./dataset/finetune/alfa/benchmark927 \
-    --setting alfa_lstm_h64_l2_sl100_cosine50 \
+    --checkpoint ./checkpoints/alfa_lstm_h64_l2_sl100_cosine50/checkpoint.pth \
+    --setting alfa_lstm_visualization \
     --features M \
     --seq_len 100 \
-    --pred_len 0 \
     --enc_in 16 \
-    --c_out 16 \
     --hidden_dim 64 \
     --depth 2 \
-    --d_model 64 \
-    --dropout 0.1 \
     --batch_size 64 \
-    --lradj cosine \
-    --learning_rate 0.001 \
-    --train_epochs 50 \
-    --train_test 0 \
-    --patience 8 \
-    --anomaly_ratio 1 \
     --num_workers 2 \
-    --random_seed 2021 \
-    --eval_after_train \
+    --anomaly_ratio 1 \
     --visualize \
     --vis_channels 0 3 6 \
-    --itr 1
+    --vis_start 0 \
+    --vis_context 100 \
+    --vis_max_events 3

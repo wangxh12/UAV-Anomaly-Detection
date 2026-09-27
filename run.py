@@ -1,28 +1,26 @@
 import argparse
 import os
-import torch
-import torch.backends
-from utils.print_args import print_args
 import random
+import re
+from pathlib import Path
+
 import numpy as np
+import torch
+import torch.distributed as dist
 
-if __name__ == '__main__':
-    fix_seed = 2021
-    random.seed(fix_seed)
-    torch.manual_seed(fix_seed)
-    np.random.seed(fix_seed)
 
-    parser = argparse.ArgumentParser(description='TimesNet')
+def build_parser():
+    parser = argparse.ArgumentParser(description='UAV reconstruction anomaly detection')
 
     # basic config
-    parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
+    parser.add_argument('--task_name', type=str, default='anomaly_detection',
                         help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
-    parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
-    parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
+    parser.add_argument('--is_training', type=int, choices=[0, 1], default=None, help='legacy pretraining flag')
+    parser.add_argument('--model_id', type=str, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='Autoformer',
                         help='model name, options: [Autoformer, Transformer, TimesNet]')
-    parser.add_argument('--is_finetuning', type=int, default=0, help='status')
-    parser.add_argument('--is_zeroshot', type=int, default=1, help='status')
+    parser.add_argument('--is_finetuning', type=int, choices=[0, 1], default=None, help='status')
+    parser.add_argument('--is_zeroshot', type=int, choices=[0, 1], default=None, help='status')
     parser.add_argument('--train_test', type=int, default=1, help='train_test')
 
     # data loader
@@ -106,8 +104,8 @@ if __name__ == '__main__':
     parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
     parser.add_argument('--des', type=str, default='test', help='exp description')
-    parser.add_argument('--loss', type=str, default='MSE', help='loss function')
-    parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
+    parser.add_argument('--loss', choices=['MSE'], default='MSE', help='loss function')
+    parser.add_argument('--lradj', choices=['type1', 'type2', 'type3', 'cosine', 'constant', 'constant_with_warmup'], default='type1', help='adjust learning rate')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
     parser.add_argument('--finetune_epochs', type=int, default=10, help='finetuning epochs')
 
@@ -117,7 +115,7 @@ if __name__ == '__main__':
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
     parser.add_argument('--gpu_type', type=str, default='cuda', help='gpu type')  # cuda or mps
     parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=False)
-    parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
+    parser.add_argument('--devices', type=str, default=None, help='device ids of multile gpus')
 
     # de-stationary projector params
     parser.add_argument('--p_hidden_dims', type=int, nargs='+', default=[128, 128],
@@ -171,97 +169,127 @@ if __name__ == '__main__':
     parser.add_argument('--top_p', type=float, default=0.5, help='Dynamic Routing in MoE')
     parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
 
-    args = parser.parse_args()
-    if torch.cuda.is_available() and args.use_gpu:
-        args.device = torch.device('cuda:{}'.format(args.gpu))
-        print('Using GPU')
-    else:
-        if hasattr(torch.backends, "mps"):
-            args.device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-        else:
-            args.device = torch.device("cpu")
-        print('Using cpu or mps')
+    # Stage is independent of the model's task_name (anomaly_detection).
+    parser.add_argument('--stage', choices=['train', 'pretrain', 'finetune', 'zeroshot', 'test'])
+    parser.add_argument('--checkpoint', help='input weights for fine-tuning/evaluation; never inferred from a dataset name')
+    parser.add_argument('--setting', help='optional output run name (single directory component)')
+    parser.add_argument('--results', default='./test_results', help='evaluation output root')
+    parser.add_argument('--eval_after_train', action='store_true', help='evaluate best weights after train/pretrain/finetune')
+    parser.add_argument('--pretrain_epochs', type=int, default=None, help='defaults to train_epochs')
+    parser.add_argument('--finetune_modules', nargs='+', help='parameter/module prefixes to update; default: all parameters')
+    parser.add_argument('--forward_api', choices=['tslib', 'x', 'norm'], default='tslib')
+    parser.add_argument('--reconstruction_index', type=int, help='explicit reconstruction index for tuple/list outputs')
+    parser.add_argument('--ddp_find_unused_parameters', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--warmup_steps', type=int, default=10000)
+    parser.add_argument('--random_seed', type=int, default=2021)
+    parser.add_argument('--visualize', action='store_true', help='save original-timeline diagnostic plots after evaluation')
+    parser.add_argument('--vis_channels', type=int, nargs='+', help='zero-based channel indices; defaults to first three')
+    parser.add_argument('--vis_start', type=int, default=0)
+    parser.add_argument('--vis_end', type=int, help='exclusive original sample index')
+    parser.add_argument('--vis_context', type=int, default=100, help='samples around each anomaly event')
+    parser.add_argument('--vis_max_events', type=int, default=3)
 
-    if args.use_gpu and args.use_multi_gpu:
-        args.devices = args.devices.replace(' ', '')
-        device_ids = args.devices.split(',')
-        args.device_ids = [int(id_) for id_ in device_ids]
-        args.gpu = args.device_ids[0]
+    return parser
 
-    print('Args in experiment:')
-    print_args(args)
 
-    if args.task_name == 'anomaly_detection':
-        from exp.exp_anomaly_detection import Exp_Anomaly_Detection
-        Exp = Exp_Anomaly_Detection
-    else:
-        raise ValueError('task name not found')
-    
-    
+def resolve_stage(args, parser):
+    legacy = []
     if args.is_training == 1:
-        for ii in range(args.itr):
-            # setting record of experiments
-            setting = '{}_{}_{}_sl{}_prl{}_pal{}_st{}_dm{}_hd{}_dp{}_{}'.format(
-                args.task_name,
-                args.model,
-                args.data,
-                args.seq_len,
-                args.pred_len,
-                args.patch_len,
-                args.stride,
-                args.d_model,
-                args.hidden_dim,
-                args.depth,
-                ii)
-            args.setting = setting
-            exp = Exp(args)  # set experiments
-            print('>>>>>>>start pretraining : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
-            exp.train(setting)
-
+        legacy.append('pretrain')
     if args.is_finetuning == 1:
-        for ii in range(args.itr):
-            # setting record of experiments
-            setting = '{}_{}_{}_sl{}_prl{}_pal{}_st{}_dm{}_hd{}_dp{}_{}'.format(
-                args.task_name,
-                args.model,
-                args.data,
-                args.seq_len,
-                args.pred_len,
-                args.patch_len,
-                args.stride,
-                args.d_model,
-                args.hidden_dim,
-                args.depth,
-                ii)
-            args.setting = setting
-            exp = Exp(args)  # set experiments
+        legacy.append('finetune')
+    if args.is_zeroshot == 1:
+        legacy.append('zeroshot')
+    if len(legacy) > 1:
+        parser.error('Select one stage per invocation; connect stages with --checkpoint')
+    if args.stage and legacy and args.stage != legacy[0]:
+        if not (args.stage == 'train' and legacy[0] == 'pretrain'):
+            parser.error('--stage conflicts with legacy stage flags')
+    args.stage = args.stage or (legacy[0] if legacy else ('test' if args.is_training == 0 else 'train'))
+    if args.stage in ('finetune', 'zeroshot', 'test') and not args.checkpoint:
+        parser.error(f'{args.stage} requires --checkpoint')
+    if args.checkpoint and not Path(args.checkpoint).is_file():
+        parser.error(f'Checkpoint not found: {args.checkpoint}')
+    if args.percentage != 1:
+        parser.error('Current loaders do not implement percentage sampling; provide data prepared under your protocol')
+    if args.finetune_modules and args.stage != 'finetune':
+        parser.error('--finetune_modules applies only to finetune')
+    if args.task_name != 'anomaly_detection':
+        parser.error('Use --task_name anomaly_detection; choose the lifecycle with --stage')
+    if args.setting and (args.setting in ('.', '..') or '/' in args.setting or chr(92) in args.setting):
+        parser.error('--setting must be a single directory name')
+    for name in ('train_epochs', 'finetune_epochs', 'batch_size', 'itr', 'patience'):
+        if getattr(args, name) <= 0:
+            parser.error(f'--{name} must be positive')
+    if args.pretrain_epochs is not None and args.pretrain_epochs <= 0:
+        parser.error('--pretrain_epochs must be positive')
+    if args.num_workers < 0 or args.warmup_steps < 0:
+        parser.error('num_workers and warmup_steps must be nonnegative')
+    if not 0 <= args.anomaly_ratio <= 100:
+        parser.error('--anomaly_ratio must be in [0, 100]')
+    if args.use_multi_gpu and int(os.environ.get('WORLD_SIZE', '1')) <= 1 and 'RANK' not in os.environ:
+        parser.error('--use_multi_gpu requires torchrun; it does not spawn processes')
+    if args.vis_start < 0 or args.vis_context < 0 or args.vis_max_events < 0:
+        parser.error('Visualization start/context/event count must be nonnegative')
+    if args.vis_end is not None and args.vis_end <= args.vis_start:
+        parser.error('--vis_end must be greater than --vis_start')
+    return args.stage
 
-            print('>>>>>>>start fine-tuning : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
-            if args.data == 'Monash_ADD':
+
+def make_setting(args, repeat):
+    if args.setting:
+        return args.setting if args.itr == 1 else f'{args.setting}_{repeat}'
+    name = (f'{args.stage}_{args.model_id}_{args.model}_{args.data}_sl{args.seq_len}'
+            f'_dm{args.d_model}_hd{args.hidden_dim}_dp{args.depth}_{repeat}')
+    return re.sub(r'[^a-zA-Z0-9_.-]', '_', name)
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    resolve_stage(args, parser)
+    # Visibility must be set before CUDA is initialized. GPU ids inside Python
+    # are logical ids in this visible set; torchrun selects LOCAL_RANK.
+    if args.devices:
+        devices = args.devices.replace(' ', '')
+        visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+        if visible is not None and visible != devices:
+            parser.error('--devices conflicts with CUDA_VISIBLE_DEVICES')
+        os.environ['CUDA_VISIBLE_DEVICES'] = devices
+    from exp.exp_anomaly_detection import Exp_Anomaly_Detection
+    try:
+        for repeat in range(args.itr):
+            seed_everything(args.random_seed + repeat)
+            setting = make_setting(args, repeat)
+            args.setting_name = setting
+            exp = Exp_Anomaly_Detection(args)
+            seed_everything(args.random_seed + repeat + exp.rank)
+            exp.print_main(f'>>>>>>> {args.stage}: {setting}')
+            if args.stage == 'pretrain':
+                exp.pretrain(setting)
+            elif args.stage == 'finetune':
                 exp.finetuning(setting)
+            elif args.stage == 'train':
+                exp.train(setting)
+            elif args.stage == 'zeroshot':
+                exp.zeroshot(setting)
             else:
-                exp.finetuning(setting, train=1)
-                print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
                 exp.test(setting)
-            torch.cuda.empty_cache()
-    else:
-        if args.data != 'Monash_ADD':
-            ii = 0
-            setting = '{}_{}_{}_sl{}_prl{}_pal{}_st{}_dm{}_hd{}_dp{}_{}'.format(
-                args.task_name,
-                args.model,
-                args.data,
-                args.seq_len,
-                args.pred_len,
-                args.patch_len,
-                args.stride,
-                args.d_model,
-                args.hidden_dim,
-                args.depth,
-                ii)
-            args.setting = setting
-            exp = Exp(args)  # set experiments
-            
-            print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            exp.test(setting, test=1)
-            torch.cuda.empty_cache()
+            if args.eval_after_train and args.stage in ('train', 'pretrain', 'finetune'):
+                exp.test(setting)
+            del exp
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+if __name__ == '__main__':
+    main()

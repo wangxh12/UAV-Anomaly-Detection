@@ -1,204 +1,136 @@
+"""Device, checkpoint initialization and DDP ownership for experiments."""
+
 import os
-import importlib
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from exp.exp_basic import LazyModelDict
+from utils.distributed import active, on_main
 
-class Exp_Basic(object):
+
+class Exp_Basic:
     def __init__(self, args):
         self.args = args
-
-        # -------------------------------------------------------
-        #  Distributed environment
-        # -------------------------------------------------------
-        self._init_distributed()
-
-        # -------------------------------------------------------
-        #  Automatically generate model map
-        # -------------------------------------------------------
-        model_map = self._scan_models_directory()
-
-        # Use smart dictionary
-        self.model_dict = LazyModelDict(model_map)
-
-        # -------------------------------------------------------
-        #  Device
-        # -------------------------------------------------------
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.distributed = self.world_size > 1
         self.device = self._acquire_device()
-
-        # -------------------------------------------------------
-        #  Build model
-        # -------------------------------------------------------
-        self.model = self._build_model().to(self.device)
-
-        # -------------------------------------------------------
-        #  DistributedDataParallel
-        # -------------------------------------------------------
-        if self.distributed:
-            self.model = DDP(
-                self.model, device_ids=[self.local_rank], output_device=self.local_rank
-            )
-
-    def _init_distributed(self):
-        """
-        Initialize distributed training environment.
-
-        torchrun automatically provides:
-            LOCAL_RANK
-            RANK
-            WORLD_SIZE
-        """
-
-        self.distributed = (
-            "RANK" in os.environ
-            and "WORLD_SIZE" in os.environ
-            and int(os.environ["WORLD_SIZE"]) > 1
+        if self.distributed and not active():
+            backend = "nccl" if self.device.type == "cuda" else "gloo"
+            dist.init_process_group(backend=backend, init_method="env://")
+        if active():
+            self.rank, self.world_size = dist.get_rank(), dist.get_world_size()
+            self.distributed = self.world_size > 1
+        args.device = self.device
+        args.rank, args.local_rank, args.world_size = (
+            self.rank,
+            self.local_rank,
+            self.world_size,
         )
+        args.distributed = args.use_multi_gpu = self.distributed
+        model_dir = Path(__file__).resolve().parents[1] / "models"
+        self.model_dict = LazyModelDict(
+            {
+                file.stem: f"models.{file.stem}"
+                for file in model_dir.glob("*.py")
+                if file.stem != "__init__"
+            }
+        )
+        self.model = self._build_model().to(self.device)
+        if args.checkpoint:
+            self.load_checkpoint(args.checkpoint)
+        self._configure_trainable_parameters()
+        if self.distributed and args.stage in ("train", "pretrain", "finetune"):
+            options = {"find_unused_parameters": args.ddp_find_unused_parameters}
+            if self.device.type == "cuda":
+                options.update(
+                    device_ids=[self.local_rank], output_device=self.local_rank
+                )
+            self.model = DDP(self.model, **options)
+        self.print_main(f"Device: {self.device}; world_size: {self.world_size}")
 
-        if self.distributed:
-            self.local_rank = int(os.environ["LOCAL_RANK"])
-            self.rank = int(os.environ["RANK"])
-            self.world_size = int(os.environ["WORLD_SIZE"])
-
-            torch.cuda.set_device(self.local_rank)
-
-            if not dist.is_initialized():
-                dist.init_process_group(backend="nccl", init_method="env://")
-
-        else:
-            self.local_rank = 0
-            self.rank = 0
-            self.world_size = 1
+    def _acquire_device(self):
+        if not self.args.use_gpu:
+            return torch.device("cpu")
+        if self.args.gpu_type == "cuda":
+            if torch.cuda.is_available():
+                index = self.local_rank if self.distributed else self.args.gpu
+                torch.cuda.set_device(index)
+                return torch.device("cuda", index)
+            if self.distributed:
+                raise RuntimeError(
+                    "CUDA DDP requested but CUDA is unavailable; use --no_use_gpu for Gloo"
+                )
+            return torch.device("cpu")
+        if self.args.gpu_type == "mps":
+            if self.distributed:
+                raise ValueError("MPS distributed training is not supported")
+            if torch.backends.mps.is_available():
+                return torch.device("mps")
+            return torch.device("cpu")
+        raise ValueError(f"Unsupported gpu_type: {self.args.gpu_type}")
 
     @property
     def is_main_process(self):
-        """
-        Only global rank 0 is responsible for logging,
-        checkpoint saving, etc.
-        """
         return self.rank == 0
 
+    @property
+    def raw_model(self):
+        return self.model.module if isinstance(self.model, DDP) else self.model
+
     def print_main(self, *args, **kwargs):
-        """
-        Print only on global rank 0.
-        """
         if self.is_main_process:
             print(*args, **kwargs)
-
-    def _scan_models_directory(self):
-        """
-        Automatically scan all .py files in the models folder.
-        """
-        model_map = {}
-        models_dir = "models"
-
-        if os.path.exists(models_dir):
-            for filename in os.listdir(models_dir):
-                if filename.endswith(".py") and filename != "__init__.py":
-                    module_name = filename[:-3]
-                    full_path = f"{models_dir}.{module_name}"
-                    model_map[module_name] = full_path
-
-        return model_map
 
     def _build_model(self):
         raise NotImplementedError
 
-    def _acquire_device(self):
-        """
-        Acquire computing device.
-
-        In DDP:
-            each process uses exactly one GPU specified by LOCAL_RANK.
-
-        In non-DDP:
-            use the original single-GPU / MPS / CPU behavior.
-        """
-
-        # -------------------------------------------------------
-        # DDP
-        # -------------------------------------------------------
-        if self.distributed:
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "DDP with NCCL requires CUDA, but CUDA is unavailable."
-                )
-            device = torch.device(f"cuda:{self.local_rank}")
-            self.print_main(f"Use Distributed GPU: " f"world_size={self.world_size}")
-            return device
-
-        # -------------------------------------------------------
-        # Single GPU
-        # -------------------------------------------------------
-        if self.args.use_gpu and self.args.gpu_type == "cuda":
-            device = torch.device(f"cuda:{self.args.gpu}")
-            print(f"Use GPU: cuda:{self.args.gpu}")
-
-        # -------------------------------------------------------
-        # MPS
-        # -------------------------------------------------------
-        elif self.args.use_gpu and self.args.gpu_type == "mps":
-            device = torch.device("mps")
-            print("Use GPU: mps")
-
-        # -------------------------------------------------------
-        # CPU
-        # -------------------------------------------------------
-        else:
-            device = torch.device("cpu")
-            print("Use CPU")
-        return device
-
-    def _get_data(self):
-        pass
-
-    def vali(self):
-        pass
-
-    def train(self):
-        pass
-
-    def test(self):
-        pass
-
-
-class LazyModelDict(dict):
-    """
-    Smart Lazy-Loading Dictionary
-    """
-
-    def __init__(self, model_map):
-        self.model_map = model_map
-        super().__init__()
-
-    def __getitem__(self, key):
-        if key in self:
-            return super().__getitem__(key)
-
-        if key not in self.model_map:
-            raise NotImplementedError(f"Model [{key}] not found in 'models' directory.")
-
-        module_path = self.model_map[key]
-        try:
-            module = importlib.import_module(module_path)
-        except ImportError as e:
-            raise ImportError(
-                f"Failed to import model [{key}] "
-                f"from [{module_path}]. "
-                f"Dependencies missing?"
-            ) from e
-
-        # Try to find the model class
-        if hasattr(module, "Model"):
-            model_class = module.Model
-        elif hasattr(module, key):
-            model_class = getattr(module, key)
-        else:
-            raise AttributeError(
-                f"Module {module_path} has no class 'Model' or '{key}'"
+    def _configure_trainable_parameters(self):
+        prefixes = self.args.finetune_modules
+        if self.args.stage != "finetune" or not prefixes:
+            return
+        names = list(self.raw_model.named_parameters())
+        for prefix in prefixes:
+            if not any(
+                name == prefix or name.startswith(prefix + ".") for name, _ in names
+            ):
+                raise ValueError(f"No parameters match finetune module: {prefix}")
+        for name, parameter in names:
+            parameter.requires_grad_(
+                any(name == p or name.startswith(p + ".") for p in prefixes)
             )
 
-        self[key] = model_class
-        return model_class
+    def load_checkpoint(self, path):
+        """Accept new checkpoints and legacy plain DP/DDP state dictionaries."""
+        payload = torch.load(path, map_location=self.device, weights_only=True)
+        state = payload.get("model_state_dict", payload.get("state_dict", payload))
+        while state and all(key.startswith("module.") for key in state):
+            state = {key[7:]: value for key, value in state.items()}
+        self.raw_model.load_state_dict(state, strict=True)
+        self.print_main(f"Loaded checkpoint: {path}")
+        return payload
+
+    def save_checkpoint(self, path, epoch, val_loss):
+        def save():
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            config = {
+                key: str(value) if isinstance(value, (torch.device, Path)) else value
+                for key, value in vars(self.args).items()
+            }
+            payload = {
+                "model_state_dict": self.raw_model.state_dict(),
+                "epoch": epoch,
+                "val_loss": val_loss,
+                "stage": self.args.stage,
+                "config": config,
+            }
+            temporary = target.with_suffix(target.suffix + ".tmp")
+            torch.save(payload, temporary)
+            os.replace(temporary, target)
+
+        on_main(save)

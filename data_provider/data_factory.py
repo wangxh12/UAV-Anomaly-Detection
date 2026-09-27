@@ -11,6 +11,8 @@ from data_provider.data_loader import (
 
 from data_provider.data_loader import ALFASegLoader
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from utils.distributed import active, main_process, DistributedEvalSampler
 
 data_dict = {
     "ETTh1": Dataset_ETT_hour,
@@ -27,11 +29,12 @@ data_dict = {
 }
 
 
-def data_provider(args, flag):
+def data_provider(args, flag, distributed=None, shuffle=None):
     Data = data_dict[args.data]
     timeenc = 0 if args.embed != "timeF" else 1
 
-    shuffle_flag = False if (flag == "test" or flag == "TEST") else True
+    shuffle_flag = (flag == "train") if shuffle is None else shuffle
+    use_distributed = active() if distributed is None else distributed
     drop_last = False
     batch_size = args.batch_size
     freq = args.freq
@@ -44,11 +47,19 @@ def data_provider(args, flag):
             win_size=args.seq_len,
             flag=flag,
         )
-        print(flag, len(data_set))
+        if len(data_set) == 0:
+            raise ValueError(f"Empty {flag} dataset; check sequence length and data files")
+        if main_process():
+            print(flag, len(data_set))
+        sampler = None
+        if use_distributed:
+            sampler = (DistributedSampler(data_set, shuffle=shuffle_flag, seed=getattr(args, "random_seed", 2021))
+                       if flag == "train" else DistributedEvalSampler(data_set))
         data_loader = DataLoader(
             data_set,
             batch_size=batch_size,
-            shuffle=shuffle_flag,
+            shuffle=shuffle_flag if sampler is None else False,
+            sampler=sampler,
             num_workers=args.num_workers,
             drop_last=drop_last,
         )
@@ -68,11 +79,19 @@ def data_provider(args, flag):
             freq=freq,
             seasonal_patterns=args.seasonal_patterns,
         )
-        print(flag, len(data_set))
+        if len(data_set) == 0:
+            raise ValueError(f"Empty {flag} dataset; check sequence length and data files")
+        if main_process():
+            print(flag, len(data_set))
+        sampler = None
+        if use_distributed:
+            sampler = (DistributedSampler(data_set, shuffle=shuffle_flag, seed=getattr(args, "random_seed", 2021))
+                       if flag == "train" else DistributedEvalSampler(data_set))
         data_loader = DataLoader(
             data_set,
             batch_size=batch_size,
-            shuffle=shuffle_flag,
+            shuffle=shuffle_flag if sampler is None else False,
+            sampler=sampler,
             num_workers=args.num_workers,
             drop_last=drop_last,
         )
