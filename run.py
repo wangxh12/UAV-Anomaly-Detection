@@ -21,6 +21,9 @@ if __name__ == '__main__':
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='Autoformer',
                         help='model name, options: [Autoformer, Transformer, TimesNet]')
+    parser.add_argument('--is_finetuning', type=int, default=0, help='status')
+    parser.add_argument('--is_zeroshot', type=int, default=1, help='status')
+    parser.add_argument('--train_test', type=int, default=1, help='train_test')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='ETTh1', help='dataset type')
@@ -32,6 +35,8 @@ if __name__ == '__main__':
     parser.add_argument('--freq', type=str, default='h',
                         help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
     parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
+    parser.add_argument('--stride', type=int, default=1, help='stride')
+    parser.add_argument('--step', type=int, default=1, help='step')
 
     # forecasting task
     parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
@@ -83,8 +88,17 @@ if __name__ == '__main__':
                         help='down sampling method, only support avg, max, conv')
     parser.add_argument('--seg_len', type=int, default=96,
                         help='the length of segmen-wise iteration of SegRNN')
+    parser.add_argument('--norm', type=int, default=0, help='True 1 False 0')
+    parser.add_argument('--hidden_dim', type=int, default=64, help='embedding dimenison')
+    parser.add_argument('--depth', type=int, default=10, help='number of layers')
+
+    # evaluation
+    parser.add_argument('--metric', type=str, nargs="+", default="affiliation", help="metric")
+    parser.add_argument('--q', type=float, nargs="+", default=[0.03], help="for SPOT")
+    parser.add_argument('--t', type=float, nargs="+", default=[0.06], help="threshold found by SPOT")
 
     # optimization
+    parser.add_argument("--percentage", type=float, default=1, help="the percentage(*100) of train data")
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
@@ -95,6 +109,7 @@ if __name__ == '__main__':
     parser.add_argument('--loss', type=str, default='MSE', help='loss function')
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
+    parser.add_argument('--finetune_epochs', type=int, default=10, help='finetuning epochs')
 
     # GPU
     parser.add_argument('--use_gpu', action='store_true', default=True, help='use gpu (default: on)')
@@ -176,106 +191,77 @@ if __name__ == '__main__':
     print('Args in experiment:')
     print_args(args)
 
-
-    if args.task_name == 'long_term_forecast':
-        from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
-        Exp = Exp_Long_Term_Forecast
-    elif args.task_name == 'short_term_forecast':
-        from exp.exp_short_term_forecasting import Exp_Short_Term_Forecast
-        Exp = Exp_Short_Term_Forecast
-    elif args.task_name == 'imputation':
-        from exp.exp_imputation import Exp_Imputation
-        Exp = Exp_Imputation
-    elif args.task_name == 'anomaly_detection':
+    if args.task_name == 'anomaly_detection':
         from exp.exp_anomaly_detection import Exp_Anomaly_Detection
         Exp = Exp_Anomaly_Detection
-    elif args.task_name == 'classification':
-        from exp.exp_classification import Exp_Classification
-        Exp = Exp_Classification
-    elif args.task_name == 'zero_shot_forecast':
-        from exp.exp_zero_shot_forecasting import Exp_Zero_Shot_Forecast
-        Exp = Exp_Zero_Shot_Forecast
     else:
-        from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
-        Exp = Exp_Long_Term_Forecast
-
-    if args.is_training:
+        raise ValueError('task name not found')
+    
+    
+    if args.is_training == 1:
         for ii in range(args.itr):
             # setting record of experiments
-            exp = Exp(args)  # set experiments
-            setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_{}'.format(
+            setting = '{}_{}_{}_sl{}_prl{}_pal{}_st{}_dm{}_hd{}_dp{}_{}'.format(
                 args.task_name,
-                args.model_id,
                 args.model,
                 args.data,
-                args.features,
                 args.seq_len,
-                args.label_len,
                 args.pred_len,
+                args.patch_len,
+                args.stride,
                 args.d_model,
-                args.n_heads,
-                args.e_layers,
-                args.d_layers,
-                args.d_ff,
-                args.expand,
-                args.d_conv,
-                args.factor,
-                args.embed,
-                args.distil,
-                args.des, ii)
-            
-            # Override setting for specific model to ensure proper checkpoint naming and logging
-            if args.model == 'MambaSingleLayer' and args.task_name == 'classification':
-                setting = f'{args.task_name}_CLS_{args.model_id}_{args.model}_{args.data}_ft{args.features}' \
-                        + f'_sl{args.seq_len}_ll{args.label_len}_pl{args.pred_len}_dm{args.d_model}_ds{args.d_ff}' \
-                        + f'_expand{args.expand}_dc{args.d_conv}_nk{args.num_kernels}' \
-                        + f'_tvdt{int(args.tv_dt)}_tvB{int(args.tv_B)}_tvC{int(args.tv_C)}_useD{int(args.use_D)}_{args.des}_{ii}'
-
-            print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
+                args.hidden_dim,
+                args.depth,
+                ii)
+            args.setting = setting
+            exp = Exp(args)  # set experiments
+            print('>>>>>>>start pretraining : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
 
-            print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            exp.test(setting)
-            if args.use_gpu:
-                if args.gpu_type == 'mps':
-                    torch.backends.mps.empty_cache()
-                elif args.gpu_type == 'cuda':
-                    torch.cuda.empty_cache()
-    else:
-        exp = Exp(args)  # set experiments
-        ii = 0
-        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_{}'.format(
-            args.task_name,
-            args.model_id,
-            args.model,
-            args.data,
-            args.features,
-            args.seq_len,
-            args.label_len,
-            args.pred_len,
-            args.d_model,
-            args.n_heads,
-            args.e_layers,
-            args.d_layers,
-            args.d_ff,
-            args.expand,
-            args.d_conv,
-            args.factor,
-            args.embed,
-            args.distil,
-            args.des, ii)
-        
-        # Override setting for specific model to ensure proper checkpoint naming and logging
-        if args.model == 'MambaSingleLayer' and args.task_name == 'classification':
-            setting = f'{args.task_name}_CLS_{args.model_id}_{args.model}_{args.data}_ft{args.features}' \
-                    + f'_sl{args.seq_len}_ll{args.label_len}_pl{args.pred_len}_dm{args.d_model}_ds{args.d_ff}' \
-                    + f'_expand{args.expand}_dc{args.d_conv}_nk{args.num_kernels}' \
-                    + f'_tvdt{args.tv_dt}_tvB{args.tv_B}_tvC{args.tv_C}_useD{int(args.use_D)}_{args.des}_{ii}'
+    if args.is_finetuning == 1:
+        for ii in range(args.itr):
+            # setting record of experiments
+            setting = '{}_{}_{}_sl{}_prl{}_pal{}_st{}_dm{}_hd{}_dp{}_{}'.format(
+                args.task_name,
+                args.model,
+                args.data,
+                args.seq_len,
+                args.pred_len,
+                args.patch_len,
+                args.stride,
+                args.d_model,
+                args.hidden_dim,
+                args.depth,
+                ii)
+            args.setting = setting
+            exp = Exp(args)  # set experiments
 
-        print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-        exp.test(setting, test=1)
-        if args.use_gpu:
-            if args.gpu_type == 'mps':
-                torch.backends.mps.empty_cache()
-            elif args.gpu_type == 'cuda':
-                torch.cuda.empty_cache()
+            print('>>>>>>>start fine-tuning : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
+            if args.data == 'Monash_ADD':
+                exp.finetuning(setting)
+            else:
+                exp.finetuning(setting, train=1)
+                print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+                exp.test(setting)
+            torch.cuda.empty_cache()
+    else:
+        if args.data != 'Monash_ADD':
+            ii = 0
+            setting = '{}_{}_{}_sl{}_prl{}_pal{}_st{}_dm{}_hd{}_dp{}_{}'.format(
+                args.task_name,
+                args.model,
+                args.data,
+                args.seq_len,
+                args.pred_len,
+                args.patch_len,
+                args.stride,
+                args.d_model,
+                args.hidden_dim,
+                args.depth,
+                ii)
+            args.setting = setting
+            exp = Exp(args)  # set experiments
+            
+            print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+            exp.test(setting, test=1)
+            torch.cuda.empty_cache()

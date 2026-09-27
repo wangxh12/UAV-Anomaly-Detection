@@ -8,6 +8,68 @@ import math
 
 plt.switch_backend('agg')
 
+class LargeScheduler:
+    def __init__(self, args, optimizer) -> None:
+        super().__init__()
+        self.learning_rate = args.learning_rate
+        self.decay_fac = args.decay_fac
+        self.lradj = args.lradj
+        self.use_multi_gpu = args.use_multi_gpu
+        self.optimizer = optimizer
+        self.args = args
+        if self.use_multi_gpu:
+            self.local_rank = args.local_rank
+        else:
+            self.local_rank = None
+        self.warmup_steps = args.warmup_steps
+
+    def schedule_epoch(self, epoch: int):
+        if self.lradj == 'type1':
+            lr_adjust = {epoch: self.learning_rate if epoch < 3 else self.learning_rate * (0.9 ** ((epoch - 3) // 1))}
+        elif self.lradj == 'type2':
+            lr_adjust = {epoch: self.learning_rate * (self.decay_fac ** ((epoch - 1) // 1))}
+        elif self.lradj == 'type4':
+            lr_adjust = {epoch: self.learning_rate * (self.decay_fac ** ((epoch) // 1))}
+        elif self.lradj == 'type3':
+            self.learning_rate = 1e-4
+            lr_adjust = {epoch: self.learning_rate if epoch < 3 else self.learning_rate * (0.9 ** ((epoch - 3) // 1))}
+        elif self.lradj == 'cos_epoch':
+            lr_adjust = {epoch: self.learning_rate / 2 * (1 + math.cos(epoch / self.args.cos_max_decay_epoch * math.pi))}
+        else:
+            return
+
+        if epoch in lr_adjust.keys():
+            lr = lr_adjust[epoch]
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+            print('Updating learning rate to {}'.format(lr))
+
+    def schedule_step(self, n: int):
+        if self.lradj == 'cos_step':
+            if n < self.args.warmup_steps:
+                res = (self.args.cos_max - self.learning_rate) / self.args.warmup_steps * n + self.learning_rate
+                self.last = res
+            else:
+                t = (n - self.args.warmup_steps) / (self.args.cos_max_decay_steps - self.args.warmup_steps)
+                t = min(t, 1.0)
+                res = self.args.cos_min + 0.5 * (self.args.cos_max - self.args.cos_min) * (1 + np.cos(t * np.pi))
+                self.last = res
+        elif self.lradj == 'constant_with_warmup':
+            if n < self.warmup_steps:
+                # Linear warmup
+                res = self.learning_rate * n / max(1, self.warmup_steps)
+            else:
+                # Constant learning rate after warmup
+                res = self.learning_rate
+        else:
+            return
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = res
+        if n % 500 == 0:
+            print('Updating learning rate to {}'.format(res))
+
+
 
 def adjust_learning_rate(optimizer, epoch, args):
     # lr = args.learning_rate * (0.2 ** (epoch // 2))
